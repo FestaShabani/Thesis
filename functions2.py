@@ -9,6 +9,8 @@ import copy
 from IPython.display import display
 from aif360.algorithms.preprocessing.optim_preproc_helpers.data_preproc_functions\
         import load_preproc_data_adult
+from clearbox_engine import Dataset, Preprocessor, TabularEngine, LabeledSynthesizer
+from sklearn.preprocessing import OneHotEncoder, LabelEncoder
 
 #bias mitigation algorithms
 from aif360.algorithms.preprocessing.reweighing import Reweighing
@@ -36,7 +38,7 @@ np.random.seed(1)
 # Append a path if needed
 sys.path.append("../")
 
-def load_and_process_data(dataset_name, use_disparate_impact_remover=False, use_optim_preproc=False):
+def load_and_process_data(dataset_name, use_disparate_impact_remover=False):
     """
     Load and preprocess the dataset based on the name provided.
     Optionally, use DisparateImpactRemover based on the flag.
@@ -65,8 +67,11 @@ def load_and_process_data(dataset_name, use_disparate_impact_remover=False, use_
         
 
     elif dataset_name == 'meps':
-        def preprocess_meps_dataset(meps_dataset, use_disparate_impact_remover=False, use_optim_preproc=False):
-       
+        def preprocess_meps_dataset(meps_dataset, use_disparate_impact_remover=False):
+            """
+            Preprocess the MEPS dataset for AIF360, with the option to apply 
+            DisparateImpactRemover and removing categorical features.
+            """
             # Convert MEPSDataset19 to a DataFrame
             df, metadata = meps_dataset.convert_to_dataframe()
 
@@ -80,9 +85,7 @@ def load_and_process_data(dataset_name, use_disparate_impact_remover=False, use_
 
             df.rename(columns={'SEX=1': 'SEX'}, inplace=True)
             df['RACE'] = df['RACE'].replace({'White': 1.0, 'Non-White': 0.0})
-        
-
-
+            
             # Step 2: Handle scaling and feature renaming
             if use_disparate_impact_remover:
                 # For DisparateImpactRemover: Remove categorical features
@@ -114,31 +117,13 @@ def load_and_process_data(dataset_name, use_disparate_impact_remover=False, use_
                 )
                 df = df[selected_columns]
 
-        
-            if use_optim_preproc: 
-                num_bins = 10  # Number of bins for discretization
-                df['PCS42_bin'] = pd.qcut(df['PCS42'], q=num_bins, labels=False, duplicates='drop')
-                df['MCS42_bin'] = pd.qcut(df['MCS42'], q=num_bins, labels=False, duplicates='drop')
-
-                # Drop the original continuous columns
-                df.drop(columns=['PCS42', 'MCS42'], inplace=True)
-
-                #Rename back 
-                df.rename(columns={'PCS42_bin': 'PCS42'}, inplace=True)
-                df.rename(columns={'MCS42_bin': 'MCS42'}, inplace=True)
-
-                # Step 4: Retain only numerical features, including discretized bins
-                selected_columns = ['RACE', 'SEX', 'PCS42', 'MCS42', 'UTILIZATION']
-                df = df[selected_columns]
-                
-
             # Create the processed AIF360 dataset
             processed_dataset = StandardDataset(
                 df,
                 label_name='UTILIZATION',
                 favorable_classes=[1.0],
-                protected_attribute_names=['RACE'],
-                privileged_classes=[[1.0]],  # Privileged groups: White and Male
+                protected_attribute_names=['RACE', 'SEX'],
+                privileged_classes=[[1.0], [1.0]],  # Privileged groups: White and Male
             )
 
             return processed_dataset
@@ -149,19 +134,7 @@ def load_and_process_data(dataset_name, use_disparate_impact_remover=False, use_
         
         # Use the appropriate preprocessing based on whether DisparateImpactRemover is needed
         meps = MEPSDataset19()
-        processed_meps = preprocess_meps_dataset(meps, use_disparate_impact_remover, use_optim_preproc)
-
-        
-        if use_optim_preproc:
-            # Add protected_attribute_maps
-            protected_attribute_maps = [
-                {1.0: 'White', 0.0: 'Non-white'}  # For RACE
-            ]
-            processed_meps.metadata['protected_attribute_maps'] = protected_attribute_maps
-
-            # Add label_maps 
-            label_maps = [{1.0: 'Utilized', 0.0: 'Not Utilized'}]  # For UTILIZATION label
-            processed_meps.metadata['label_maps'] = label_maps
+        processed_meps = preprocess_meps_dataset(meps, use_disparate_impact_remover)
 
         # Splitting the MEPS dataset
         train, val_test = processed_meps.split([0.7], shuffle=True, seed=42)
@@ -169,56 +142,8 @@ def load_and_process_data(dataset_name, use_disparate_impact_remover=False, use_
         
         return train, val, test, privileged_groups, unprivileged_groups
             
-def get_distortion_medical(vold, vnew):
-                # Helper function to adjust UTILIZATION labels to numeric values
-                def adjustUtil(a):
-                    if a == "Utilized":
-                        return 1
-                    elif a == "Not Utilized":
-                        return 0
-                    else:
-                        return int(a)
 
-                # Helper functions to clean PCS42_bin and MCS42_bin
-                def adjustBin(b):
-                    return int(b) if b is not None else 0  # Default to 0 for safety
-
-                # Value that represents a large penalty for invalid transformations
-                bad_val = 3.0
-
-                # Adjust PCS42_bin and MCS42_bin
-                pcs_old = adjustBin(vold['PCS42'])
-                pcs_new = adjustBin(vnew['PCS42'])
-
-                mcs_old = adjustBin(vold['MCS42'])
-                mcs_new = adjustBin(vnew['MCS42'])
-
-                # PCS42_bin and MCS42_bin cannot change by more than 1 bin
-                if abs(pcs_new - pcs_old) > 1 or abs(mcs_new - mcs_old) > 1:
-                    return bad_val  # Large jumps are heavily penalized
-
-                # Adjust UTILIZATION
-                util_old = adjustUtil(vold['UTILIZATION'])
-                util_new = adjustUtil(vnew['UTILIZATION'])
-
-                # Initialize distortion penalty
-                distortion = 0
-
-                # Penalty for changes in PCS42_bin and MCS42_bin
-                if pcs_new != pcs_old:
-                    distortion += 1.0
-                if mcs_new != mcs_old:
-                    distortion += 1.0
-
-                # Penalty for changes in UTILIZATION
-                if util_old > util_new:  # Decrease in UTILIZATION (undesirable)
-                    distortion += 2.0
-                elif util_old < util_new:  # Increase in UTILIZATION
-                    distortion += 1.0
-
-                return distortion
-
-def apply_bias_mitigation(method, train, test, unprivileged_groups, privileged_groups, sensitive_attribute, dataset_name):
+def apply_bias_mitigation(method, train, test, unprivileged_groups, privileged_groups):
     
     if method == 'reweighing':
         reweighing = Reweighing(unprivileged_groups=unprivileged_groups,
@@ -230,26 +155,18 @@ def apply_bias_mitigation(method, train, test, unprivileged_groups, privileged_g
     elif method == 'lfr':
         lfr = LFR(unprivileged_groups=unprivileged_groups,
                 privileged_groups=privileged_groups,
-                k=10, Ax=0.1, Ay=1, Az=1.7, seed=42,
+                k=10, Ax=0.1, Ay=1.0, Az=1.5,
                 verbose=1)
         train_transf = lfr.fit_transform(train)
         test_transf = lfr.transform(test)
     
     elif method == 'optimpreproc':
-        if dataset_name == 'meps':
-            optim_options = {
-            "distortion_fun": get_distortion_medical,
-            "epsilon": 0.01, 
-            "clist": [0.99],
-            "dlist": [.1]
-        }  
-        else:
-            optim_options = {
-                "distortion_fun": get_distortion_adult,
-                "epsilon": 0.05,
-                "clist": [0.99, 1.99, 2.99],
-                "dlist": [.1, 0.05, 0]
-            } 
+        optim_options = {
+            "distortion_fun": get_distortion_adult,
+            "epsilon": 0.05,
+            "clist": [0.99, 1.99, 2.99],
+            "dlist": [.1, 0.05, 0]
+        } 
 
         optim_preproc = OptimPreproc(OptTools, optim_options,
                         unprivileged_groups = unprivileged_groups,
@@ -263,7 +180,7 @@ def apply_bias_mitigation(method, train, test, unprivileged_groups, privileged_g
         test_transf = test.align_datasets(test_transf)
     
     elif method == 'disparateimpactremover':
-        disp_impact_remover = DisparateImpactRemover(repair_level= 1.0, sensitive_attribute=sensitive_attribute)
+        disp_impact_remover = DisparateImpactRemover(repair_level= 1.0, sensitive_attribute="sex")
         train_transf = disp_impact_remover.fit_transform(train)
         test_transf = disp_impact_remover.fit_transform(test)
     
@@ -466,40 +383,6 @@ def train_classifier_on_transformed_data(train_transf, test_transf, classifier_t
 
     return classifier, test_scores, metrics
 
-def evaluate_on_transformed_data_LFR(test, test_transf, best_threshold, unprivileged_groups, privileged_groups):
-
-    # Apply the best threshold to classify test set
-    test_scores = test_transf.scores.ravel()
-    test_LR_predictions = (test_scores >= best_threshold).astype(int) 
-
-    # Create a copy of the test dataset and set predicted labels
-    test_with_LR_scores = copy.deepcopy(test)
-    test_with_LR_scores.labels = test_LR_predictions.reshape(-1, 1)
-
-    # Calculate fairness and performance metrics
-    test_metric = ClassificationMetric(test, test_with_LR_scores,
-                                       unprivileged_groups=unprivileged_groups,
-                                       privileged_groups=privileged_groups)
-    
-    metrics = {
-        'balanced_accuracy': (test_metric.true_positive_rate() + test_metric.true_negative_rate()) / 2,
-        'statistical_parity_difference': test_metric.statistical_parity_difference(),
-        'disparate_impact': test_metric.disparate_impact(),
-        'average_odds_difference': test_metric.average_odds_difference(),
-        'equal_opportunity_difference': test_metric.equal_opportunity_difference(),
-        'theil_index': test_metric.theil_index()
-    }
-
-    # Print the metrics
-    print(f"Balanced Accuracy (test transformed): {metrics['balanced_accuracy']}")
-    print(f"Statistical Parity Difference (test transformed): {metrics['statistical_parity_difference']}")
-    print(f"Disparate Impact (test transformed): {metrics['disparate_impact']}")
-    print(f"Average Odds Difference (test transformed): {metrics['average_odds_difference']}")
-    print(f"Equal Opportunity Difference (test transformed): {metrics['equal_opportunity_difference']}")
-    print(f"Theil Index (test transformed): {metrics['theil_index']}")
-
-    return test_scores, metrics
-
 def standardize_features(train, val, test):
     # Standardizing the features
     scaler = StandardScaler()
@@ -616,7 +499,7 @@ def extract_fairness_metrics(
     return fairness_metrics, validation_metrics, test_metrics
 
 
-def train_classifier_with_dir(train, test, classifier_type, best_threshold, unprivileged_groups, privileged_groups, sensitive_attribute, repair_levels=np.linspace(0., 1., 11)):
+def train_classifier_with_dir(train, test, classifier_type, best_threshold, unprivileged_groups, privileged_groups, sensitive_attribute="sex", repair_levels=np.linspace(0., 1., 11)):
     
     # Select classifier
     if classifier_type == 'logistic_regression':
@@ -639,7 +522,7 @@ def train_classifier_with_dir(train, test, classifier_type, best_threshold, unpr
         print(f"\n=== Repair Level: {repair_level} ===")
         
         # Apply Disparate Impact Remover with the current repair level
-        disparate_impact_remover = DisparateImpactRemover(repair_level=repair_level, sensitive_attribute=sensitive_attribute)
+        disparate_impact_remover = DisparateImpactRemover(repair_level=repair_level, sensitive_attribute="sex")
         train_transf = disparate_impact_remover.fit_transform(train)
         test_transf = disparate_impact_remover.fit_transform(test)
         
@@ -697,7 +580,7 @@ def train_classifier_with_dir(train, test, classifier_type, best_threshold, unpr
 
     return results_df
 
-def apply_DIR(train, test, chosen_repair_level, classifier_type, best_threshold, unprivileged_groups, privileged_groups, sensitive_attribute):
+def apply_DIR(train, test, chosen_repair_level, classifier_type, best_threshold, unprivileged_groups, privileged_groups, sensitive_attribute="sex"):
 
 
     repair_level = chosen_repair_level
@@ -724,7 +607,7 @@ def apply_DIR(train, test, chosen_repair_level, classifier_type, best_threshold,
     print(f"\n=== Repair Level: {repair_level} ===")
     
     # Apply Disparate Impact Remover with the current repair level
-    disparate_impact_remover = DisparateImpactRemover(repair_level=repair_level, sensitive_attribute=sensitive_attribute)
+    disparate_impact_remover = DisparateImpactRemover(repair_level=repair_level, sensitive_attribute="sex")
     train_transf = disparate_impact_remover.fit_transform(train)
     test_transf = disparate_impact_remover.fit_transform(test)
     
@@ -740,7 +623,7 @@ def apply_DIR(train, test, chosen_repair_level, classifier_type, best_threshold,
                                             indexOfSensitiveAttribute,
                                             axis=1)
     # Apply the best threshold to the transf test set
-    test_transf_scores = classifier.predict_proba(X_test_transf_without_sensitive_attribute)[:, 1] 
+    test_transf_scores = classifier.predict_proba(X_test_transf_without_sensitive_attribute)[:, 1] #only for the favorable class?
     test_transf_LR_predictions= (test_transf_scores >= best_threshold).astype(int)
 
     # Create a copy of the test dataset and set predicted labels
@@ -837,7 +720,7 @@ def plot_metrics_dir(test, test_scores, best_threshold, unprivileged_groups, pri
     fig.legend(lines1 + lines2, labels1 + labels2, loc="upper center", bbox_to_anchor=(0.5, -0.1), ncol=3, fontsize=12)
 
     # Title and layout adjustments
-    fig.suptitle("Test Metrics vs Threshold (original test data)", fontsize=16)
+    fig.suptitle("Test Metrics vs Threshold (transformed test data)", fontsize=16)
     fig.tight_layout()
     plt.show()
 
@@ -886,6 +769,105 @@ def plot_metrics_aod(test, test_scores, best_threshold, unprivileged_groups, pri
     fig.legend(lines1 + lines2, labels1 + labels2, loc="upper center", bbox_to_anchor=(0.5, -0.1), ncol=3, fontsize=12)
 
     # Title and layout adjustments
-    fig.suptitle("Test Metrics vs Threshold (original test data)", fontsize=16)
+    fig.suptitle("Test Metrics vs Threshold (transformed test data)", fontsize=16)
     fig.tight_layout()
     plt.show()
+
+
+#Adult synthetic
+LICENSE_KEY = "licensekeyoverride2023@"
+
+def aif360_to_clearbox(aif360_dataset, target_column):
+
+    df, _ = aif360_dataset.convert_to_dataframe()
+
+    if 'Income Binary' in df.columns:
+        df = df.rename(columns={'Income Binary': 'income'})
+
+    return Dataset(
+        data=df,
+        target_column=target_column,
+        regression=False,  
+        name="Converted AIF360 Dataset"
+    )
+
+
+def filter_dataset(dataset, filter_type):
+    features_array = dataset.get_x()
+    labels_array = dataset.get_y()
+    features_df = pd.DataFrame(features_array, columns=dataset.x_columns())
+    # Determine the filter mask based on the filter_type
+    if filter_type == "positive_women":
+        mask = (features_df["sex"] == 0) & (labels_array == 1)
+    elif filter_type == "positive_women_unprivileged_race":
+        mask = (features_df["sex"] == 0) & (features_df["race"] == 0) & (labels_array == 1)
+    elif filter_type == "positive_women_above_70":
+        mask = (features_df["sex"] == 0) & (features_df["Age (decade)=>=70"] == 1) & (labels_array == 1)
+    else:
+        raise ValueError(f"Unknown filter type: {filter_type}")
+    filtered_features = features_df.loc[mask]
+    filtered_labels = pd.Series(labels_array).loc[mask].reset_index(drop=True)
+    combined_df = pd.concat([filtered_features.reset_index(drop=True), filtered_labels.rename("income")], axis=1)
+    return Dataset(
+        data=combined_df,
+        column_types=dataset.column_types,
+        target_column="income",
+        regression=dataset.regression
+    ), combined_df
+
+def generate_multiple_synthetic_datasets(
+    dataset_df, 
+    target_column, 
+    engine_class, 
+    num_datasets, 
+    epochs=5, 
+    learning_rate=0.001, 
+    half=False, 
+    extra_percentage=0.5
+):
+
+    dataset = Dataset(
+        data=dataset_df,
+        target_column=target_column,
+        column_types=None,
+        regression=False,
+    )
+    preprocessor = Preprocessor(dataset)
+    X = preprocessor.transform(dataset.get_x())
+
+    label_encoder = LabelEncoder()
+    Y = label_encoder.fit_transform(dataset.get_y()).reshape(-1, 1)  # Convert to numerical and reshape
+    
+    # Ensure all data types are numerical
+    X = X.astype(float)
+    Y = Y.astype(float)
+
+    engine = engine_class(
+        license_key=LICENSE_KEY,
+        layers_size=[50],
+        x_shape=X.shape[1:],
+        y_shape=Y.shape[1:],
+        ordinal_feature_sizes=preprocessor.get_features_sizes()[0],
+        categorical_feature_sizes=preprocessor.get_features_sizes()[1],
+    )
+
+    print("Training Tabular Engine...")
+    engine.fit(X, y_train_ds=Y, epochs=epochs, learning_rate=learning_rate)
+
+    synthesizer = LabeledSynthesizer(dataset, engine)
+
+    # Generate the main synthetic datasets
+    synthetic_data_list = [synthesizer.generate(has_header=True) for _ in range(num_datasets)]
+    
+    # Add a partial synthetic dataset if `half` is True
+    if half:
+        extra_data_size = int(len(dataset_df) * extra_percentage)
+        print(f"Generating an extra partial synthetic dataset of size: {extra_data_size}")
+        extra_synthetic_data = synthesizer.generate(has_header=True).sample(n=extra_data_size, random_state=42)
+        synthetic_data_list.append(extra_synthetic_data)
+
+    # Combine all synthetic datasets
+    concatenated_synthetic_data = pd.concat(synthetic_data_list, axis=0, ignore_index=True)
+    
+    return concatenated_synthetic_data
+    
